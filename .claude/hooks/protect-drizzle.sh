@@ -3,6 +3,8 @@
 # drizzle-kit writes those files from src/db/schema.ts; a hand edit makes the
 # migration differ from the schema snapshot, and a database that already ran the
 # old file never sees the change. Exit 2 = block, stderr = what to do instead.
+# Without jq the hook reads no path and no command and lets every write through: fail closed.
+command -v jq >/dev/null || { echo "Blocked: jq is missing: install it (see the setup guide)." >&2; exit 2; }
 input=$(cat)
 case $(jq -r '.tool_name // empty' <<<"$input") in Read|Grep|Glob) exit 0 ;; esac   # reading drizzle/ is fine
 path=$(jq -r '.tool_input.file_path // .tool_input.path // empty' <<<"$input")
