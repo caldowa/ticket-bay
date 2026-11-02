@@ -76,9 +76,12 @@ export async function listUnpaidCancelRefunds(db: DbLike, eventId: string): Prom
   return (await listCancelRefunds(db, eventId)).filter((o) => o.refundId === null && (o.refundCents ?? 0) > 0);
 }
 
+/** The largest Postgres INTEGER. */
+const MAX_INTEGER = 2 ** 31 - 1;
+
 /** Order ids are Postgres INTEGERs: anything else cannot name an order. */
 export function isOrderId(id: number): boolean {
-  return Number.isSafeInteger(id) && id > 0;
+  return Number.isSafeInteger(id) && id > 0 && id <= MAX_INTEGER;
 }
 
 /**
