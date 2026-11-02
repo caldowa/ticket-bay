@@ -58,6 +58,23 @@ export async function signIn(page: Page, user: E2EUser, next = "/") {
 }
 
 /**
+ * Creates a new account through the real /sign-up page. Better Auth signs the
+ * new customer in at once and the form sends the browser on to `next`; waits
+ * there like signIn does.
+ */
+export async function signUp(page: Page, user: E2EUser, next = "/") {
+  await page.goto(`/sign-up?next=${encodeURIComponent(next)}`);
+  await expect(page.getByRole("heading", { name: "Create your account" })).toBeVisible();
+  await page.setExtraHTTPHeaders({ "x-forwarded-for": clientIp() });
+  await page.getByLabel("Name").fill(user.name);
+  await page.getByLabel("Email").fill(user.email);
+  await page.getByLabel("Password").fill(E2E_PASSWORD);
+  await page.getByRole("button", { name: "Create account" }).click();
+  await page.waitForURL((u) => u.pathname + u.search === next);
+  await page.waitForLoadState("networkidle");
+}
+
+/**
  * Pays as the signed-in account; lands on the confirmation page. Returns the
  * order id. Tickets always go to the account email — checkout shows it, it is
  * not a field the customer fills in any more.
