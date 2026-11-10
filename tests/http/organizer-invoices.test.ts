@@ -1,0 +1,341 @@
+// GET /api/v1/organizer/invoices end to end: real Requests into the route
+// handler, real Better Auth API keys, real Postgres (Testcontainers): which
+// orders it invoices, who may read it (TicketBay admins), what it writes, how
+// it answers a bad query. Tests named "pins current behaviour — suspected bug: …"
+// pin a known problem that is not fixed yet.
+//
+// The export writes reports/invoices-<month>.csv/.txt and appends to
+// reports/outbox.log (gitignored), and its running invoice number lives in
+// the module for the whole file, so the tests compare numbers, not absolutes.
+import { describe, it, expect, vi, beforeAll, afterAll, type MockInstance } from "vitest";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import type { Auth } from "../../src/auth/auth";
+import { orders } from "../../src/db/schema";
+import { createFakeStripe } from "../../src/payments";
+import { customer, makeAdmin, makeAuth, scopedKey, useCleanAccounts } from "../integration/accounts";
+import { useTestDatabase } from "../integration/database";
+import { NOW, venue } from "../integration/fixtures";
+import { bearer, call, loadRoutes, quietRefusedKeyLogs } from "./client";
+
+const wiring = vi.hoisted(() => ({ auth: undefined as unknown, db: undefined as unknown, payments: undefined as unknown }));
+vi.mock("@/lib/auth", () => ({ appBaseURL: () => "http://localhost:3000", getAuth: () => wiring.auth }));
+vi.mock("@/src/db/client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/db/client")>()),
+  getDb: () => wiring.db,
+}));
+vi.mock("@/src/payments", async () => ({ ...(await import("../../src/payments")), getPayments: () => wiring.payments }));
+
+const t = useTestDatabase();
+useCleanAccounts(t);
+quietRefusedKeyLogs();
+
+let auth: Auth;
+let log: MockInstance<typeof console.log>;
+
+beforeAll(async () => {
+  process.env.TICKETBAY_TEST_CLOCK = "1";
+  auth = makeAuth(t.db);
+  wiring.auth = auth;
+  wiring.db = t.db;
+  wiring.payments = createFakeStripe("sk_test_integration");
+  log = vi.spyOn(console, "log").mockImplementation(() => {});
+  await loadRoutes();
+});
+
+afterAll(() => {
+  delete process.env.TICKETBAY_TEST_CLOCK;
+  vi.restoreAllMocks();
+});
+
+const OCT = Date.UTC(2026, 9, 1);
+const NOV = Date.UTC(2026, 10, 1);
+
+let n = 0;
+async function paidOrder(eventId: string, over: Partial<typeof orders.$inferInsert> = {}) {
+  const [o] = await t.db
+    .insert(orders)
+    .values({
+      eventId,
+      customerEmail: "fan@example.com",
+      customerName: "A Fan",
+      quantity: 2,
+      subtotalCents: 13000,
+      discountPercent: 10,
+      discountCents: 1300,
+      ticketsCents: 11700,
+      feeCents: 351,
+      totalCents: 12051,
+      vatCents: 2562,
+      paymentId: `ch_${++n}`,
+      idempotencyKey: `inv-${n}`,
+      createdAtMs: OCT + 2 * 86_400_000,
+      ...over,
+    })
+    .returning();
+  return o!;
+}
+
+/** An API key of a TicketBay admin (the default) or of a plain customer. */
+async function keyHolder(scope: "read" | "read-write" = "read-write", { admin = true } = {}) {
+  const c = await customer(auth);
+  if (admin) await makeAdmin(t.db, c.id);
+  if (scope === "read-write") return c.key;
+  return (await scopedKey(auth, c.id, "read")).key;
+}
+
+const invoices = async (query: string, key?: string) =>
+  call({ path: "/api/v1/organizer/invoices" + query, headers: key ? bearer(key) : {}, nowMs: NOW });
+
+const lineIds = (body: { organizers: { lines: { orderId: number }[] }[] }) => body.organizers.flatMap((g) => g.lines.map((l) => l.orderId));
+const numbers = (body: { organizers: { lines: { invoiceNo: string }[] }[] }) => body.organizers.flatMap((g) => g.lines.map((l) => l.invoiceNo));
+const seqOf = (invoiceNo: string) => Number(invoiceNo.split("-")[2]);
+
+describe("GET /api/v1/organizer/invoices — who may call it", () => {
+  it("without a key: 401 with a WWW-Authenticate header", async () => {
+    const r = await invoices("?month=2026-10");
+    expect(r.status).toBe(401);
+    expect(r.headers.get("www-authenticate")).toBe('Bearer realm="TicketBay API"');
+    expect(r.body.error).toMatch(/API key/);
+  });
+
+  it("an unknown key: 401 saying the key does not work, with a WWW-Authenticate header", async () => {
+    const r = await invoices("?month=2026-10", "tb_not_a_real_key");
+    expect(r.status).toBe(401);
+    expect(r.headers.get("www-authenticate")).toBe('Bearer realm="TicketBay API"');
+    expect(r.body.error).toMatch(/^This API key does not work \(.+\)\. Create a new one under Settings → Developers\.$/);
+  });
+
+  it("a customer's key, read-only or read-write: 403, nothing written", async () => {
+    const ev = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    await paidOrder(ev.id, { customerName: "Somebody Else", customerEmail: "somebody@else.example" });
+    for (const scope of ["read", "read-write"] as const) {
+      log.mockClear();
+      const r = await invoices("?month=2026-10", await keyHolder(scope, { admin: false }));
+      expect(r.status, scope).toBe(403);
+      expect(r.body).toEqual({ error: "The organizer reports are for TicketBay admins only." });
+      expect(r.text).not.toContain("Somebody Else");
+      expect(log).not.toHaveBeenCalled();
+    }
+  });
+
+  it("an admin's read-only key reads the export", async () => {
+    const ev = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    await paidOrder(ev.id);
+    const r = await invoices("?month=2026-10", await keyHolder("read"));
+    expect(r.status, r.text).toBe(200);
+  });
+});
+
+describe("GET /api/v1/organizer/invoices — which orders it invoices", () => {
+  it("every paid order created in the UTC month, the first millisecond in, the next month's first out", async () => {
+    const ev = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    const before = await paidOrder(ev.id, { createdAtMs: OCT - 1 });
+    const first = await paidOrder(ev.id, { createdAtMs: OCT });
+    const last = await paidOrder(ev.id, { createdAtMs: NOV - 1 });
+    const after = await paidOrder(ev.id, { createdAtMs: NOV });
+    const r = await invoices("?month=2026-10", await keyHolder());
+    expect(r.status, r.text).toBe(200);
+    expect(lineIds(r.body)).toEqual([first.id, last.id]);
+    expect(lineIds(r.body)).not.toContain(before.id);
+    expect(lineIds(r.body)).not.toContain(after.id);
+  });
+
+  it("leaves out refunded orders", async () => {
+    const ev = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    const paid = await paidOrder(ev.id);
+    await paidOrder(ev.id, { status: "refunded", refundedAtMs: OCT + 3 * 86_400_000, refundCents: 11700 });
+    const r = await invoices("?month=2026-10", await keyHolder());
+    expect(lineIds(r.body)).toEqual([paid.id]);
+    expect(r.body.totals.invoices).toBe(1);
+  });
+
+  it("?event= keeps only that event's orders", async () => {
+    const a = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    const b = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    await paidOrder(a.id);
+    const mine = await paidOrder(b.id);
+    const r = await invoices("?month=2026-10&event=dome-show", await keyHolder());
+    expect(lineIds(r.body)).toEqual([mine.id]);
+  });
+
+  it("groups by organizer in venue order, lines by order id, with the VAT split of tickets_cents", async () => {
+    const dome = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    const a38 = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    const d1 = await paidOrder(dome.id, { ticketsCents: 999 });
+    const a1 = await paidOrder(a38.id, { ticketsCents: 12700 });
+    const a2 = await paidOrder(a38.id);
+    const r = await invoices("?month=2026-10", await keyHolder());
+    expect(r.body.organizers.map((g: { organizer: string }) => g.organizer)).toEqual(["Danube Stage Kft.", "Dome Arena Productions Zrt."]);
+    expect(lineIds(r.body)).toEqual([a1.id, a2.id, d1.id]);
+    expect(r.body.organizers[0].lines[0]).toMatchObject({ grossCents: 12700, vatCents: 2700, netCents: 10000, discountPercent: 10, date: "2026-10-03", tickets: 2 });
+    expect(r.body.totals).toEqual({ invoices: 3, grossCents: 12700 + 11700 + 999, vatCents: 2700 + 2487 + 212, netCents: 10000 + 9213 + 787 });
+    expect(r.body.batchId).toBe(`INV-2026-10-${a1.id}`);
+    expect(r.body.month).toBe("2026-10");
+  });
+});
+
+describe("GET /api/v1/organizer/invoices — what it writes", () => {
+  it("writes the CSV and the printable copy under reports/, and mails each organizer", async () => {
+    const a38 = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    const dome = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    await paidOrder(a38.id, { customerName: "Csv Check" });
+    await paidOrder(dome.id);
+    const outbox = path.join(process.cwd(), "reports", "outbox.log");
+    const outboxBefore = fs.existsSync(outbox) ? fs.readFileSync(outbox, "utf8").length : 0;
+
+    const r = await invoices("?month=2026-10", await keyHolder());
+    expect(r.body.files).toEqual(["reports/invoices-2026-10.csv", "reports/invoices-2026-10.txt"]);
+    expect(r.body.emailsSent).toBe(2);
+    const csv = fs.readFileSync(path.join(process.cwd(), r.body.files[0]), "utf8");
+    expect(csv.trimEnd().split("\n")).toHaveLength(3);
+    expect(csv).toContain(",Danube Stage Kft.,56789012-2-43,Csv Check,");
+    const txt = fs.readFileSync(path.join(process.cwd(), r.body.files[1]), "utf8");
+    expect(txt).toContain("Seller: Dome Arena Productions Zrt.");
+    const sent = fs.readFileSync(outbox, "utf8").slice(outboxBefore);
+    expect(sent).toContain("To: finance@danubestage.example\nSubject: TicketBay invoices 2026-10 (" + r.body.batchId + ")");
+    expect(sent).toContain("To: settlements@domearena.example\n");
+  });
+
+  it("each mail is one outbox entry: To, Subject, Date, a blank line, the body, a ----- separator", async () => {
+    const ev = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    await paidOrder(ev.id);
+    const outbox = path.join(process.cwd(), "reports", "outbox.log");
+    const before = fs.existsSync(outbox) ? fs.readFileSync(outbox, "utf8").length : 0;
+    const r = await invoices("?month=2026-10", await keyHolder());
+    const entry = fs.readFileSync(outbox, "utf8").slice(before);
+    expect(entry).toMatch(
+      new RegExp(
+        "^To: finance@danubestage\\.example\\nSubject: TicketBay invoices 2026-10 \\(" + r.body.batchId + "\\)\\n" +
+          "Date: \\w{3}, \\d{2} \\w{3} \\d{4} \\d{2}:\\d{2}:\\d{2} GMT\\n\\nDear Danube Stage Kft\\.,\\n[\\s\\S]*\\nTicketBay Finance\\n\\n-----\\n$",
+      ),
+    );
+  });
+
+  it("logs the export, the paid order count, the files written and every mail", async () => {
+    const ev = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    await paidOrder(ev.id);
+    await paidOrder(ev.id);
+    const key = await keyHolder();
+    log.mockClear();
+    const r = await invoices("?month=2026-10&event=a38-night", key);
+    const csv = path.join(process.cwd(), "reports", "invoices-2026-10.csv");
+    const txt = path.join(process.cwd(), "reports", "invoices-2026-10.txt");
+    expect(log.mock.calls.map((c) => c.join(" "))).toEqual([
+      "[invoices] export 2026-10 (2026-10-01T00:00:00.000Z - 2026-11-01T00:00:00.000Z) event=a38-night",
+      "[invoices] 2 paid orders",
+      `[invoices] wrote ${csv} and ${txt}`,
+      `[invoices] mail -> finance@danubestage.example (TicketBay invoices 2026-10 (${r.body.batchId}))`,
+    ]);
+  });
+
+  it("an outbox it cannot write is logged and the export still succeeds", async () => {
+    const ev = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    await paidOrder(ev.id);
+    const key = await keyHolder();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ticketbay-outbox-"));
+    // a directory where the outbox file should be: appending to it fails
+    fs.mkdirSync(path.join(dir, "reports", "outbox.log"), { recursive: true });
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(dir);
+    try {
+      log.mockClear();
+      const r = await invoices("?month=2026-10", key);
+      expect(r.status, r.text).toBe(200);
+      expect(r.body.emailsSent).toBe(1);
+      expect(fs.existsSync(path.join(dir, "reports", "invoices-2026-10.csv"))).toBe(true);
+      const failure = log.mock.calls.find((c) => c[0] === "[invoices] could not write outbox");
+      expect(failure?.[1]).toMatchObject({ code: "EISDIR" });
+    } finally {
+      cwd.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("pins current behaviour — suspected bug: every GET issues new invoice numbers for the same orders and mails again", async () => {
+    const ev = await venue(t.db, { id: "a38-night", venue: "A38 Ship" });
+    await paidOrder(ev.id);
+    await paidOrder(ev.id);
+    const key = await keyHolder();
+    const first = await invoices("?month=2026-10", key);
+    const second = await invoices("?month=2026-10", key);
+    expect(second.body.emailsSent).toBe(1);
+    for (const no of [...numbers(first.body), ...numbers(second.body)]) expect(no).toMatch(/^TB-202610-\d{6}$/);
+    const [a, b] = numbers(first.body).map(seqOf);
+    const [c, d] = numbers(second.body).map(seqOf);
+    expect(b).toBe(a! + 1);
+    expect(c).toBe(b! + 1);
+    expect(d).toBe(c! + 1);
+  });
+});
+
+describe("GET /api/v1/organizer/invoices — the query", () => {
+  it("an event id that is not a slug: 404", async () => {
+    const r = await invoices("?month=2026-10&event=Not_A_Slug", await keyHolder());
+    expect(r.status).toBe(404);
+    expect(r.body).toEqual({ error: "Event not found." });
+  });
+
+  it("a month without the leading zero is the same month", async () => {
+    const ev = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    const o = await paidOrder(ev.id, { createdAtMs: Date.UTC(2026, 2, 5) });
+    const r = await invoices("?month=2026-3", await keyHolder());
+    expect(lineIds(r.body)).toEqual([o.id]);
+    expect(r.body.month).toBe("2026-03");
+  });
+
+  it("pins current behaviour — suspected bug: with no ?month= it exports the server's wall-clock month, not the request's clock", async () => {
+    const ev = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    const now = new Date();
+    await paidOrder(ev.id, { createdAtMs: Date.UTC(now.getFullYear(), now.getMonth(), 1) + 1 });
+    const r = await invoices("", await keyHolder());
+    expect(r.status, r.text).toBe(200);
+    expect(r.body.month).toBe(`${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`);
+  });
+
+  it("a month with no paid orders is an empty export: no organizers, zero totals, a header-only CSV, no mails", async () => {
+    const r = await invoices("?month=2026-10", await keyHolder());
+    expect(r.status, r.text).toBe(200);
+    expect(r.body).toMatchObject({
+      batchId: "INV-2026-10-0",
+      organizers: [],
+      totals: { invoices: 0, netCents: 0, vatCents: 0, grossCents: 0 },
+      files: ["reports/invoices-2026-10.csv", "reports/invoices-2026-10.txt"],
+      emailsSent: 0,
+    });
+    expect(fs.readFileSync(path.join(process.cwd(), r.body.files[0]), "utf8").trimEnd().split("\n")).toHaveLength(1);
+  });
+
+  it("an event id that is well formed but of no event: 404", async () => {
+    const ev = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    await paidOrder(ev.id);
+    const r = await invoices("?month=2026-10&event=no-such-event", await keyHolder());
+    expect(r.status).toBe(404);
+    expect(r.body).toEqual({ error: "Event not found." });
+  });
+
+  it("an existing event without paid orders in the month is an empty export", async () => {
+    await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    const r = await invoices("?month=2026-10&event=dome-show", await keyHolder());
+    expect(r.status, r.text).toBe(200);
+    expect(r.body.totals.invoices).toBe(0);
+  });
+
+  it("a month that is not YYYY-MM: 400, saying what a month looks like", async () => {
+    const key = await keyHolder();
+    for (const month of ["abc", "2026", "2026-xx", "2026-13", "2026-0", "0099-10", "2026-10x", ""]) {
+      const r = await invoices(`?month=${month}`, key);
+      expect(r.status, month).toBe(400);
+      expect(r.body, month).toEqual({ error: "month: must be YYYY-MM, e.g. 2026-10." });
+    }
+  });
+
+  it("a €0 order (100% discount) is invoiced at 0, next to the others", async () => {
+    const ev = await venue(t.db, { id: "dome-show", venue: "MVM Dome" });
+    await paidOrder(ev.id);
+    const free = await paidOrder(ev.id, { ticketsCents: 0, discountCents: 13000, discountPercent: 100, feeCents: 100, totalCents: 100 });
+    const r = await invoices("?month=2026-10", await keyHolder());
+    expect(r.status, r.text).toBe(200);
+    expect(r.body.organizers[0].lines.find((l: { orderId: number }) => l.orderId === free.id)).toMatchObject({ grossCents: 0, vatCents: 0, netCents: 0 });
+  });
+});

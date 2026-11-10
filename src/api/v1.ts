@@ -17,8 +17,12 @@ import { getEvent, listEvents, toDomainEvent } from "../db/events-repo";
 import type { EventRow, OrderRow } from "../db/schema";
 import { seatsAvailable } from "../domain/booking";
 import { earlyBirdEndsMs, type Invoice } from "../domain/invoice";
+import { isInvoiceMonth } from "../domain/invoice-export";
 import { resolveCaller } from "../mcp/caller";
+import type { Caller } from "../mcp/tools";
 import { PaymentError, type PaymentProvider } from "../payments";
+import { invoiceExport } from "../finance/invoices";
+import { payoutReport } from "../finance/payouts";
 import { cancelOwnOrder, OrderError, placeOrder, quoteOrder } from "../services/orders";
 
 export interface ApiDeps {
@@ -83,17 +87,29 @@ const API_REALM = 'Bearer realm="TicketBay API"';
 
 /** The account behind the request's API key, if the key may write. */
 async function writer(deps: ApiDeps, request: Request): Promise<{ userId: string; email: string; name: string }> {
+  const caller = await keyHolder(deps, request);
+  if (!caller.scopes.includes("tickets:write")) {
+    throw new ApiError(403, "This API key is read-only. Create a read & write key under Settings → Developers.");
+  }
+  return caller;
+}
+
+/** The account behind the request's API key, whatever its scopes. */
+async function keyHolder(deps: ApiDeps, request: Request): Promise<NonNullable<Caller>> {
   const resolved = await resolveCaller({ auth: deps.auth(), db: deps.db }, request);
   if (!resolved.ok) throw new ApiError(401, resolved.error, { "WWW-Authenticate": API_REALM });
-  const caller = resolved.caller;
-  if (!caller) {
+  if (!resolved.caller) {
     throw new ApiError(401, "This endpoint needs an API key: send `Authorization: Bearer tb_…` (create one under Settings → Developers).", {
       "WWW-Authenticate": API_REALM,
     });
   }
-  if (!caller.scopes.includes("tickets:write")) {
-    throw new ApiError(403, "This API key is read-only. Create a read & write key under Settings → Developers.");
-  }
+  return resolved.caller;
+}
+
+/** The account behind the request's API key, when it is a TicketBay admin's. */
+async function adminKeyHolder(deps: ApiDeps, request: Request): Promise<NonNullable<Caller>> {
+  const caller = await keyHolder(deps, request);
+  if (caller.role !== "admin") throw new ApiError(403, "The organizer reports are for TicketBay admins only.");
   return caller;
 }
 
@@ -246,5 +262,36 @@ export function cancelOrderEndpoint(deps: ApiDeps, request: Request, id: string)
       refund: { refundCents: r.refundCents, refundFeeCents: r.refundFeeCents, seatsReleased: r.seatsReleased },
       order: orderJson(r.order),
     });
+  });
+}
+
+// ---- Organizer reports ------------------------------------------------------
+
+/** GET /api/v1/organizer/payouts?event=…&from=…&to=… — or ?organizer=<venue> for all of its events. */
+export function organizerPayoutsEndpoint(deps: ApiDeps, request: Request): Promise<Response> {
+  return handle(request, async () => {
+    await adminKeyHolder(deps, request);
+    const q = new URL(request.url).searchParams;
+    const event = q.get("event");
+    const organizer = q.get("organizer");
+    if (event === null && organizer === null) throw new ApiError(400, "Send ?event=<event id> or ?organizer=<venue>.");
+    if (event !== null && !EventId.safeParse(event).success) throw new ApiError(404, "Event not found.");
+    if (organizer !== null && /[\u0000-\u001f]/.test(organizer)) throw new ApiError(400, "organizer: must be a venue name.");
+    const report = await payoutReport({ event, organizer, from: q.get("from"), to: q.get("to") });
+    if (!report) throw new ApiError(404, "Event not found.");
+    return Response.json(report);
+  });
+}
+
+/** GET /api/v1/organizer/invoices?month=YYYY-MM — optionally &event=… for one event. */
+export function organizerInvoicesEndpoint(deps: ApiDeps, request: Request): Promise<Response> {
+  return handle(request, async () => {
+    await adminKeyHolder(deps, request);
+    const q = new URL(request.url).searchParams;
+    const event = q.get("event");
+    const month = q.get("month");
+    if (month !== null && !isInvoiceMonth(month)) throw new ApiError(400, "month: must be YYYY-MM, e.g. 2026-10.");
+    if (event !== null && !(EventId.safeParse(event).success && (await getEvent(deps.db, event)))) throw new ApiError(404, "Event not found.");
+    return Response.json(await invoiceExport({ event, month }));
   });
 }

@@ -21,6 +21,8 @@ export const ROUTE_FILES = [
   "app/api/v1/quote/route.ts",
   "app/api/v1/orders/route.ts",
   "app/api/v1/orders/[id]/cancel/route.ts",
+  "app/api/v1/organizer/payouts/route.ts",
+  "app/api/v1/organizer/invoices/route.ts",
   "app/api/v1/[[...path]]/route.ts",
 ];
 
@@ -30,6 +32,8 @@ interface Routes {
   quote: RouteModule;
   orders: RouteModule;
   cancel: RouteModule;
+  payouts: RouteModule;
+  invoices: RouteModule;
   catchAll: RouteModule;
 }
 
@@ -43,6 +47,8 @@ export async function loadRoutes(): Promise<void> {
     quote: await import("../../app/api/v1/quote/route"),
     orders: await import("../../app/api/v1/orders/route"),
     cancel: await import("../../app/api/v1/orders/[id]/cancel/route"),
+    payouts: await import("../../app/api/v1/organizer/payouts/route"),
+    invoices: await import("../../app/api/v1/organizer/invoices/route"),
     catchAll: await import("../../app/api/v1/[[...path]]/route"),
   };
 }
@@ -57,6 +63,8 @@ function route(segments: string[]): { module: RouteModule; params: Record<string
     if (a === "quote" && b === undefined) return { module: r.quote, params: {} };
     if (a === "orders" && b === undefined) return { module: r.orders, params: {} };
     if (a === "orders" && b !== undefined && c === "cancel") return { module: r.cancel, params: { id: b } };
+    if (a === "organizer" && b === "payouts" && c === undefined) return { module: r.payouts, params: {} };
+    if (a === "organizer" && b === "invoices" && c === undefined) return { module: r.invoices, params: {} };
   }
   return { module: r.catchAll, params: segments.length ? { path: segments } : {} };
 }
